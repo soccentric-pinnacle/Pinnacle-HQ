@@ -1,0 +1,104 @@
+# Pinnacle-HQ — full deployment stack.
+#
+# Stateful services (postgres, minio, redis, keycloak) are also declared here
+# so a single `docker compose up` brings up the whole HQ. Production requires
+# secrets to be supplied via the environment (see app/config.py — the services
+# fail closed unless PINNACLEHQ_ENV=production and real secrets are set).
+#
+# Usage:  docker compose -f docker/docker-compose.yml --env-file .env up -d
+name: pinnaclehq
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${PINNACLEHQ_DB_USER:-pinnaclehq}
+      POSTGRES_PASSWORD: ${PINNACLEHQ_DB_PASSWORD:-pinnaclehq}
+      POSTGRES_DB: ${PINNACLEHQ_DB_NAME:-pinnaclehq}
+    volumes:
+      - pinnaclehq-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${PINNACLEHQ_S3_ACCESS_KEY:-pinnaclehq}
+      MINIO_ROOT_PASSWORD: ${PINNACLEHQ_S3_SECRET_KEY:-pinnaclehq-dev-secret}
+    volumes:
+      - pinnaclehq-minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment: &api-env
+      PINNACLEHQ_ENV: ${PINNACLEHQ_ENV:-production}
+      PINNACLEHQ_DATABASE_URL: postgresql+asyncpg://${ACADIAQ_DB_USER:-pinnaclehq}:${ACADIAQ_DB_PASSWORD:-pinnaclehq}@postgres:5432/${ACADIAQ_DB_NAME:-pinnaclehq}
+      PINNACLEHQ_REDIS_URL: redis://redis:6379/0
+      PINNACLEHQ_S3_ENDPOINT_URL: http://minio:9000
+      PINNACLEHQ_S3_ACCESS_KEY: ${PINNACLEHQ_S3_ACCESS_KEY:-pinnaclehq}
+      PINNACLEHQ_S3_SECRET_KEY: ${PINNACLEHQ_S3_SECRET_KEY:-pinnaclehq-dev-secret}
+      PINNACLEHQ_S3_BUCKET: ${PINNACLEHQ_S3_BUCKET:-pinnaclehq}
+      PINNACLEHQ_OIDC_ISSUER: ${PINNACLEHQ_OIDC_ISSUER:?set PINNACLEHQ_OIDC_ISSUER}
+      PINNACLEHQ_OIDC_CLIENT_ID: ${PINNACLEHQ_OIDC_CLIENT_ID:-pinnaclehq-api}
+      PINNACLEHQ_OIDC_CLIENT_SECRET: ${PINNACLEHQ_OIDC_CLIENT_SECRET:?set PINNACLEHQ_OIDC_CLIENT_SECRET}
+      PINNACLEHQ_SESSION_SECRET_KEY: ${PINNACLEHQ_SESSION_SECRET_KEY:?set PINNACLEHQ_SESSION_SECRET_KEY}
+      PINNACLEHQ_CORS_ALLOW_ORIGINS: ${PINNACLEHQ_CORS_ALLOW_ORIGINS:-http://localhost:8080}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "${PINNACLEHQ_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: python -m gateway.server
+    environment: *api-env
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${PINNACLEHQ_GATEWAY_PORT:-50051}:50051"
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web
+    depends_on:
+      - api
+    ports:
+      - "${PINNACLEHQ_WEB_PORT:-8080}:80"
+
+volumes:
+  pinnaclehq-pg-data:
+  pinnaclehq-minio-data:
